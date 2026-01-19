@@ -1,0 +1,24 @@
+{
+  "name": "imagelink",
+  "version": "1.0.0",
+  "description": "Watch directory for images and spawn them in Resonite",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "npx tsx src/index.ts"
+  },
+  "dependencies": {
+    "chokidar": "^3.5.3",
+    "ws": "^8.14.2",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.9.0",
+    "@types/ws": "^8.5.8",
+    "@types/uuid": "^9.0.6",
+    "typescript": "^5.2.2",
+    "tsx": "^4.6.0"
+  }
+}

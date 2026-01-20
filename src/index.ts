@@ -196,6 +196,21 @@ class ResoniteLinkClient {
     return this.sendMessage(message);
   }
 
+  async updateSlot(
+    slotId: string,
+    scale: { x: number; y: number; z: number }
+  ): Promise<Response> {
+    const message = {
+      $type: 'updateSlot',
+      messageId: uuidv4(),
+      data: {
+        id: slotId,
+        scale: { value: scale },
+      },
+    };
+    return this.sendMessage(message);
+  }
+
   async findSlotByName(name: string, startSlotId = 'Root', depth = 10): Promise<any | null> {
     const response = await this.getSlot(startSlotId, depth, false);
     if (!response.success) return null;
@@ -214,6 +229,92 @@ class ResoniteLinkClient {
     }
     return null;
   }
+
+  async findSlotByPath(slotPath: string): Promise<any | null> {
+    const parts = slotPath.split('/');
+    if (parts.length === 0) return null;
+
+    // Start from Root if path begins with "Root", otherwise assume it's a relative path from Root
+    let currentSlotId = 'Root';
+    let startIndex = 0;
+
+    if (parts[0] === 'Root') {
+      startIndex = 1;
+    }
+
+    // Get the full hierarchy with enough depth
+    const response = await this.getSlot('Root', parts.length + 5, false);
+    if (!response.success) return null;
+
+    let currentSlot = response.data;
+
+    // Traverse the path
+    for (let i = startIndex; i < parts.length; i++) {
+      const targetName = parts[i];
+      if (!targetName) continue;
+
+      const childSlot = currentSlot.children?.find(
+        (child: any) => child.name?.value === targetName
+      );
+
+      if (!childSlot) {
+        return null;
+      }
+
+      currentSlot = childSlot;
+    }
+
+    return currentSlot;
+  }
+
+  /**
+   * Calculate cumulative scale from Root to a given slot.
+   * Returns the product of all parent scales in the hierarchy.
+   */
+  async getCumulativeScale(slotId: string): Promise<{ x: number; y: number; z: number }> {
+    const cumulativeScale = { x: 1, y: 1, z: 1 };
+
+    // Traverse up the hierarchy collecting scales
+    let currentId = slotId;
+    const visited = new Set<string>();
+
+    while (currentId && currentId !== 'Root' && !visited.has(currentId)) {
+      visited.add(currentId);
+
+      const response = await this.getSlot(currentId, 0, false);
+      if (!response.success || !response.data) break;
+
+      const slot = response.data;
+      const scale = slot.scale?.value;
+
+      if (scale) {
+        cumulativeScale.x *= scale.x;
+        cumulativeScale.y *= scale.y;
+        cumulativeScale.z *= scale.z;
+      }
+
+      // Move to parent
+      const parentId = slot.parent?.targetId;
+      if (!parentId || parentId === currentId) break;
+      currentId = parentId;
+    }
+
+    return cumulativeScale;
+  }
+
+  /**
+   * Calculate the inverse scale needed to compensate for parent hierarchy scale.
+   * If parent hierarchy has scale 0.001, returns 1000 to make child appear at world scale.
+   */
+  async getScaleCompensation(parentSlotId: string): Promise<{ x: number; y: number; z: number }> {
+    const cumulativeScale = await this.getCumulativeScale(parentSlotId);
+
+    return {
+      x: cumulativeScale.x !== 0 ? 1 / cumulativeScale.x : 1,
+      y: cumulativeScale.y !== 0 ? 1 / cumulativeScale.y : 1,
+      z: cumulativeScale.z !== 0 ? 1 / cumulativeScale.z : 1,
+    };
+  }
 }
 
 // ============================================
@@ -224,24 +325,60 @@ async function spawnImageSlot(
   client: ResoniteLinkClient,
   imageName: string,
   assetURL: string,
-  position: { x: number; y: number; z: number }
-): Promise<string> {
+  position: { x: number; y: number; z: number },
+  parentSlotId: string,
+  knownImages: Set<string>
+): Promise<string | null> {
   console.log(`Spawning image slot: ${imageName}`);
 
-  // 1. Create main slot
+  // Check if a slot with this name already exists in the parent
+  const existingSlot = await client.findSlotByName(imageName, parentSlotId, 2);
+  if (existingSlot?.id) {
+    console.log(`Slot already exists for ${imageName} (${existingSlot.id}), skipping spawn`);
+    knownImages.add(imageName);
+    return null;
+  }
+
+  // Calculate scale compensation for parent hierarchy
+  // If parent has scale 0.001, we need to scale our slot by 1000 to appear at world scale
+  const scaleCompensation = await client.getScaleCompensation(parentSlotId);
+  const needsScaleCompensation =
+    scaleCompensation.x !== 1 || scaleCompensation.y !== 1 || scaleCompensation.z !== 1;
+
+  if (needsScaleCompensation) {
+    console.log(
+      `Parent hierarchy scale compensation: ${scaleCompensation.x.toFixed(2)}x, ${scaleCompensation.y.toFixed(2)}x, ${scaleCompensation.z.toFixed(2)}x`
+    );
+  }
+
+  // Scale position to compensate for parent scale (so position 1.5 in world space stays at 1.5)
+  const compensatedPosition = {
+    x: position.x * scaleCompensation.x,
+    y: position.y * scaleCompensation.y,
+    z: position.z * scaleCompensation.z,
+  };
+
+  // 1. Create main slot as child of target slot
   await client.addSlot({
+    parentId: parentSlotId,
     name: imageName,
-    position,
+    position: compensatedPosition,
     isActive: true,
   });
 
-  // Find the created slot
-  const slot = await client.findSlotByName(imageName, 'Root', 5);
+  // Find the created slot within the parent
+  const slot = await client.findSlotByName(imageName, parentSlotId, 2);
   if (!slot?.id) {
     throw new Error(`Failed to find created slot: ${imageName}`);
   }
   const slotId = slot.id;
   console.log(`Created slot: ${slotId}`);
+
+  // Apply scale compensation to make the image appear at world scale
+  if (needsScaleCompensation) {
+    await client.updateSlot(slotId, scaleCompensation);
+    console.log(`Applied scale compensation to slot`);
+  }
 
   // 2. Add Grabbable
   await client.addComponent(slotId, '[FrooxEngine]FrooxEngine.Grabbable');
@@ -455,12 +592,13 @@ async function spawnImageSlot(
 async function updateImageSlot(
   client: ResoniteLinkClient,
   imageName: string,
-  assetURL: string
+  assetURL: string,
+  parentSlotId: string
 ): Promise<boolean> {
   console.log(`Updating image slot: ${imageName}`);
 
-  // Find the existing slot
-  const slot = await client.findSlotByName(imageName, 'Root', 10);
+  // Find the existing slot within the target slot
+  const slot = await client.findSlotByName(imageName, parentSlotId, 5);
   if (!slot?.id) {
     console.log(`Slot not found for update: ${imageName}`);
     return false;
@@ -506,11 +644,15 @@ function isImageFile(filePath: string): boolean {
 async function main() {
   const wsUrl = process.argv[2] || 'ws://localhost:22345';
   const watchDir = process.argv[3] || path.join(process.cwd(), 'images');
+  const resoniteSlotPath = process.argv[4];
 
   console.log('ImageLink - Resonite Image Sync');
   console.log('================================');
   console.log(`WebSocket URL: ${wsUrl}`);
   console.log(`Watch directory: ${watchDir}`);
+  if (resoniteSlotPath) {
+    console.log(`Target slot: ${resoniteSlotPath}`);
+  }
 
   // Ensure images directory exists
   if (!fs.existsSync(watchDir)) {
@@ -526,6 +668,20 @@ async function main() {
   } catch (error) {
     console.error('Failed to connect to Resonite:', error);
     process.exit(1);
+  }
+
+  // Validate target slot if specified
+  let targetSlotId = 'Root';
+  if (resoniteSlotPath) {
+    console.log(`Looking for target slot: ${resoniteSlotPath}`);
+    const targetSlot = await client.findSlotByPath(resoniteSlotPath);
+    if (!targetSlot?.id) {
+      console.error('ERROR: The specified slot could not be found');
+      client.disconnect();
+      process.exit(1);
+    }
+    targetSlotId = targetSlot.id;
+    console.log(`Found target slot: ${targetSlotId}`);
   }
 
   // Track known images to detect add vs update
@@ -572,11 +728,13 @@ async function main() {
 
       if (knownImages.has(fileName)) {
         // Update existing
-        await updateImageSlot(client, fileName, importResult.assetURL);
+        await updateImageSlot(client, fileName, importResult.assetURL, targetSlotId);
       } else {
-        // Spawn new
-        knownImages.add(fileName);
-        await spawnImageSlot(client, fileName, importResult.assetURL, getSpawnPosition());
+        // Spawn new (will skip if slot already exists from previous run)
+        const slotId = await spawnImageSlot(client, fileName, importResult.assetURL, getSpawnPosition(), targetSlotId, knownImages);
+        if (slotId) {
+          knownImages.add(fileName);
+        }
       }
     } catch (error) {
       console.error(`Error processing ${fileName}:`, error);
@@ -604,12 +762,14 @@ async function main() {
       console.log(`Texture uploaded: ${importResult.assetURL}`);
 
       // Try to update existing slot
-      const updated = await updateImageSlot(client, fileName, importResult.assetURL);
+      const updated = await updateImageSlot(client, fileName, importResult.assetURL, targetSlotId);
 
       if (!updated) {
-        // Slot doesn't exist, create it
-        knownImages.add(fileName);
-        await spawnImageSlot(client, fileName, importResult.assetURL, getSpawnPosition());
+        // Slot doesn't exist, create it (will skip if slot already exists from previous run)
+        const slotId = await spawnImageSlot(client, fileName, importResult.assetURL, getSpawnPosition(), targetSlotId, knownImages);
+        if (slotId) {
+          knownImages.add(fileName);
+        }
       }
     } catch (error) {
       console.error(`Error updating ${fileName}:`, error);
